@@ -2,11 +2,11 @@ import functions_framework
 import requests
 import json
 import hashlib
-from shapely.geometry import Point, mapping
-from shapely.ops import cascaded_union
+from shapely.geometry import Point, mapping, shape
+from shapely.ops import unary_union
 import math
 from google.cloud import storage
-from shapely import wkt # Import the wkt module to parse the WKT string
+from shapely import wkt
 
 # A simple helper function to convert meters to degrees at a given latitude.
 # This is necessary for accurate buffering with Shapely.
@@ -40,8 +40,7 @@ def load_perifereies_data(bucket_name, file_path):
         geojson_data = blob.download_as_text()
         perifereies_features = json.loads(geojson_data)
         perifereies_geometries = [
-            Point(f['geometry']['coordinates']) if f['geometry']['type'] == 'Point' else
-            f['geometry'] for f in perifereies_features['features']
+            shape(f['geometry']) for f in perifereies_features['features']
         ]
         print("====DIABASA tis perifereies perifereiesWGS84.geojson")
         print(perifereies_geometries)
@@ -66,7 +65,7 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
         print("Invalid wastewater data format.")
         return None
 
-    print("XXXXXXXXXXXXX features_to_process=" )
+    print("XXXXXXXXXXXXX features_to_process=")
     print(features_to_process)
     
     for plant_feature in features_to_process:
@@ -78,30 +77,31 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
                 # If 'properties' key is not present, assume the top-level keys are the properties
                 props = plant_feature
 
-            # Use the more reliable 'receiverLocation' key
             receiver_location_wkt = props.get('receiverLocation')
+            longitude = props.get('longitude')
+            latitude = props.get('latitude')
+
+            point = None
+            if receiver_location_wkt:
+                try:
+                    point = wkt.loads(receiver_location_wkt)
+                except Exception as e:
+                    print(f"Error parsing WKT for plant '{props.get('name')}': {e}. Falling back to main coordinates.")
             
-            # Skip the plant if no valid receiverLocation is found
-            if receiver_location_wkt is None:
-                print(f"Skipping plant '{props.get('name')}' due to missing receiverLocation.")
-                continue
+            if point is None:
+                if longitude is not None and latitude is not None:
+                    point = Point(longitude, latitude)
+                else:
+                    print(f"Skipping plant '{props.get('name')}' due to missing coordinates.")
+                    continue
 
-            # Use shapely.wkt to parse the POINT string
-            try:
-                point = wkt.loads(receiver_location_wkt)
-                longitude = point.x
-                latitude = point.y
-                print("name=", props.get('name'))
-                print("longitude=",longitude)
-                print("latitude=",latitude)
-                
-            except Exception as e:
-                print(f"Skipping plant '{props.get('name')}' due to error parsing WKT: {e}")
-                continue
-
+            print("name=", props.get('name'))
+            print("longitude=", point.x)
+            print("latitude=", point.y)
+            
             # Create the 200m buffer around the point
             # Convert 200m buffer distance to degrees at the given latitude
-            buffer_lat_deg, buffer_lon_deg = meters_to_degrees(BUFFER_DISTANCE_METERS, math.radians(latitude))
+            buffer_lat_deg, buffer_lon_deg = meters_to_degrees(BUFFER_DISTANCE_METERS, math.radians(point.y))
             buffer_radius = buffer_lat_deg # Averages a reasonable buffer in degrees
 
             buffered_point = point.buffer(buffer_radius)
@@ -115,10 +115,10 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
         print("No valid wastewater points found. Exiting.")
         return None
 
-    unified_buffers = cascaded_union(all_buffers)
+    unified_buffers = unary_union(all_buffers)
 
     # Union the perifereies geometries for the difference calculation
-    unified_perifereies = cascaded_union(perifereies_geometries)
+    unified_perifereies = unary_union(perifereies_geometries)
 
     # Calculate the difference to find danger zones outside the mainland
     # The result is a new geometry representing the no-swim zones.
