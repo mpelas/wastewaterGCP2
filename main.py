@@ -43,6 +43,8 @@ def load_perifereies_data(bucket_name, file_path):
             Point(f['geometry']['coordinates']) if f['geometry']['type'] == 'Point' else
             f['geometry'] for f in perifereies_features['features']
         ]
+        print("====DIABASA tis perifereies perifereiesWGS84.geojson")
+        print(perifereies_geometries)
         return perifereies_geometries
     except Exception as e:
         print(f"Error loading perifereies GeoJSON: {e}")
@@ -64,6 +66,9 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
         print("Invalid wastewater data format.")
         return None
 
+    print("XXXXXXXXXXXXX features_to_process=" )
+    print(features_to_process)
+    
     for plant_feature in features_to_process:
         try:
             # Check for standard GeoJSON 'properties' key first
@@ -86,6 +91,10 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
                 point = wkt.loads(receiver_location_wkt)
                 longitude = point.x
                 latitude = point.y
+                print("name=", props.get('name'))
+                print("longitude=",longitude)
+                print("latitude=",latitude)
+                
             except Exception as e:
                 print(f"Skipping plant '{props.get('name')}' due to error parsing WKT: {e}")
                 continue
