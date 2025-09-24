@@ -2,3 +2,4 @@ functions-framework==3.*
 shapely==2.0.*
 flask==2.3.*
 requests
+google-cloud-storage
