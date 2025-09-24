@@ -65,8 +65,13 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
 
     for plant_feature in features_to_process:
         try:
-            # Use .get() with a fallback to avoid KeyErrors
-            props = plant_feature['properties']
+            # Check for standard GeoJSON 'properties' key first
+            if 'properties' in plant_feature:
+                props = plant_feature['properties']
+            else:
+                # If 'properties' key is not present, assume the top-level keys are the properties
+                props = plant_feature
+
             longitude = props.get('Column1.receiverLocation.1')
             latitude = props.get('Column1.receiverLocation.2')
 
