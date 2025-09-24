@@ -54,7 +54,7 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
     print("Starting geospatial analysis...")
     all_buffers = []
     
-for plant_feature in wastewater_data['features']:
+    for plant_feature in wastewater_data['features']:
         try:
             # Use .get() with a fallback to avoid KeyErrors
             props = plant_feature['properties']
