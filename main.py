@@ -54,11 +54,23 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
     print("Starting geospatial analysis...")
     all_buffers = []
     
-    for plant in wastewater_data:
+for plant_feature in wastewater_data['features']:
         try:
-            latitude = plant['Column1.receiverLocation.2']   #plant['lat']
-            longitude = plant['Column1.receiverLocation.1']  #plant['lon']
-            
+            # Use .get() with a fallback to avoid KeyErrors
+            props = plant_feature['properties']
+            longitude = props.get('Column1.receiverLocation.1')
+            latitude = props.get('Column1.receiverLocation.2')
+
+            # Fallback to the regular latitude/longitude keys if receiverLocation keys are missing or null
+            if longitude is None or latitude is None:
+                longitude = props.get('Column1.longitude')
+                latitude = props.get('Column1.latitude')
+
+            # Skip the plant if no valid coordinates are found
+            if longitude is None or latitude is None:
+                print(f"Skipping plant '{props.get('Column1.name')}' due to missing coordinates.")
+                continue
+                
             # Create a Point geometry from the coordinates
             point = Point(longitude, latitude)
 
