@@ -1,88 +1,172 @@
-import json
 import functions_framework
-from shapely.geometry import Point, shape
-from flask import jsonify
+import requests
+import json
+import hashlib
+from shapely.geometry import Point, mapping
+from shapely.ops import cascaded_union
+import math
+from google.cloud import storage
 
-# Load GeoJSON data from the file
-def load_geojson_data():
-    with open("12kmBufferGreecePErifereiesWGS84.geojson", "r", encoding="utf-8") as file:
-        geojson_data = json.load(file)
-    return geojson_data
+# A simple helper function to convert meters to degrees at a given latitude.
+# This is necessary for accurate buffering with Shapely.
+def meters_to_degrees(meters, latitude):
+    """
+    Converts a distance in meters to degrees of latitude/longitude.
+    """
+    meters_in_lat_deg = 111132.92 - 559.82 * math.cos(2 * latitude) + 1.175 * math.cos(4 * latitude)
+    meters_in_long_deg = 111412.84 * math.cos(latitude) - 93.5 * math.cos(3 * latitude)
+    return meters / meters_in_lat_deg, meters / meters_in_long_deg
 
-# Load GeoJSON data once (in memory)
-geojson_data = load_geojson_data()
+# Constants for the Cloud Function.
+# You need to replace these with your actual GCS bucket and file names.
+WASTEWATER_API_URL = "https://astikalimata.ypeka.gr/api/query/wastewatertreatmentplants"
+GCS_BUCKET_NAME = "mpelas-wastewater-bucket "
+PERIFEREIES_GEOJSON_PATH = "perifereiesWGS84.geojson"
+LAST_HASH_FILE_PATH = "wastewater_data_hash.txt"
+OUTPUT_GEOJSON_PATH = "no_swim_zones/wastewater_no_swim_zones.geojson"
+BUFFER_DISTANCE_METERS = 200
 
-# Check if a point is inside any no-swim zone and return zone details
-def check_no_swim_zone(latitude, longitude):
-    point = Point(longitude, latitude)  # GeoJSON uses [longitude, latitude] order
+def get_gcs_blob(bucket_name, blob_name):
+    """Retrieves a blob from Google Cloud Storage."""
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    return bucket.blob(blob_name)
+
+def load_perifereies_data(bucket_name, file_path):
+    """Loads and parses the large perifereies GeoJSON file from GCS."""
+    try:
+        blob = get_gcs_blob(bucket_name, file_path)
+        geojson_data = blob.download_as_text()
+        perifereies_features = json.loads(geojson_data)
+        perifereies_geometries = [
+            Point(f['geometry']['coordinates']) if f['geometry']['type'] == 'Point' else
+            f['geometry'] for f in perifereies_features['features']
+        ]
+        return perifereies_geometries
+    except Exception as e:
+        print(f"Error loading perifereies GeoJSON: {e}")
+        return None
+
+def calculate_new_zones(perifereies_geometries, wastewater_data):
+    """
+    Performs the core geospatial analysis: buffering, union, and difference.
+    """
+    print("Starting geospatial analysis...")
+    all_buffers = []
     
-    for feature in geojson_data["features"]:
-        zone = shape(feature["geometry"])
-        if point.within(zone):
-            return True, feature
+    for plant in wastewater_data:
+        try:
+            latitude = plant['Column1.receiverLocation.2']   #plant['lat']
+            longitude = plant['Column1.receiverLocation.1']  #plant['lon']
+            
+            # Create a Point geometry from the coordinates
+            point = Point(longitude, latitude)
+
+            # Convert 200m buffer distance to degrees at the given latitude
+            # We'll use the latitude conversion for both axes for simplicity
+            buffer_lat_deg, buffer_lon_deg = meters_to_degrees(BUFFER_DISTANCE_METERS, math.radians(latitude))
+            buffer_radius = buffer_lat_deg # Averages a reasonable buffer in degrees
+            
+            # Create the 200m buffer around the point
+            buffered_point = point.buffer(buffer_radius)
+            all_buffers.append(buffered_point)
+        except KeyError as e:
+            print(f"Skipping plant due to missing coordinate: {e}")
+            continue
+
+    # Union all the individual buffers into a single MultiPolygon
+    if not all_buffers:
+        print("No valid wastewater points found. Exiting.")
+        return None
+        
+    unified_buffers = cascaded_union(all_buffers)
+
+    # Union the perifereies geometries for the difference calculation
+    unified_perifereies = cascaded_union(perifereies_geometries)
     
-    return False, None
+    # Calculate the difference to find danger zones outside the mainland
+    # The result is a new geometry representing the no-swim zones.
+    danger_zones = unified_buffers.difference(unified_perifereies)
+    
+    print("Geospatial analysis complete.")
+    return danger_zones
 
 @functions_framework.http
-def check_swim_zone(request):
-    """HTTP Cloud Function to check if coordinates are in a no-swimming zone"""
+def check_for_changes(request):
+    """
+    Main entry point for the Google Cloud Function.
+    Fetches wastewater data, checks for changes, and if found,
+    recalculates and updates the no-swimming zones.
+    """
+    print("Function started.")
     
-    # Handle CORS
-    if request.method == 'OPTIONS':
-        headers = {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST',
-            'Access-Control-Allow-Headers': 'Content-Type',
-            'Access-Control-Max-Age': '3600'
-        }
-        return ('', 204, headers)
-
-    # Set CORS headers for actual request
-    headers = {'Access-Control-Allow-Origin': '*'}
-    
+    # 1. Fetch the latest wastewater data
     try:
-        # Get parameters from request
-        if request.method == 'GET':
-            latitude = request.args.get('latitude', type=float)
-            longitude = request.args.get('longitude', type=float)
-        elif request.method == 'POST':
-            request_json = request.get_json()
-            if request_json:
-                latitude = request_json.get('latitude')
-                longitude = request_json.get('longitude')
-            else:
-                return jsonify({'error': 'Invalid JSON'}), 400, headers
+        response = requests.get(WASTEWATER_API_URL, timeout=30)
+        response.raise_for_status()
+        wastewater_data = response.json()
+        current_data_string = json.dumps(wastewater_data, sort_keys=True)
+        current_hash = hashlib.sha256(current_data_string.encode('utf-8')).hexdigest()
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to fetch data from API: {e}")
+        return ("Failed to fetch data.", 500)
+    
+    # 2. Compare with the last known hash from GCS
+    try:
+        hash_blob = get_gcs_blob(GCS_BUCKET_NAME, LAST_HASH_FILE_PATH)
+        if hash_blob.exists():
+            last_hash = hash_blob.download_as_text()
+            if current_hash == last_hash:
+                print("No changes detected in wastewater data. Exiting.")
+                return ("No changes detected.", 200)
         else:
-            return jsonify({'error': 'Method not allowed'}), 405, headers
-            
-        if latitude is None or longitude is None:
-            return jsonify({'error': 'Missing latitude or longitude parameters'}), 400, headers
+            print("No previous hash found. Proceeding with analysis.")
+    except Exception as e:
+        print(f"Error checking last hash: {e}")
+        # Continue anyway in case of an error accessing GCS
         
-        # Check if point is in no-swim zone
-        in_zone, zone_details = check_no_swim_zone(latitude, longitude)
+    # 3. If changes detected, perform geospatial analysis
+    print("Changes detected. Starting geospatial analysis...")
+    
+    # Load the large Greek perifereies GeoJSON from GCS
+    perifereies_geometries = load_perifereies_data(GCS_BUCKET_NAME, PERIFEREIES_GEOJSON_PATH)
+    if perifereies_geometries is None:
+        return ("Failed to load perifereies data.", 500)
         
-        result = {
-            'in_no_swim_zone': in_zone,
-            'coordinates': {
-                'latitude': latitude,
-                'longitude': longitude
-            }
+    # Calculate the new no-swimming zones
+    danger_zones_geometry = calculate_new_zones(perifereies_geometries, wastewater_data)
+    
+    if danger_zones_geometry is None:
+        return ("Analysis failed.", 500)
+
+    # 4. Save the new zones and update the hash in GCS
+    try:
+        # Create a GeoJSON FeatureCollection from the resulting geometry
+        new_zones_geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": mapping(danger_zones_geometry),
+                    "properties": {}
+                }
+            ]
         }
         
-        # If in a no-swim zone, include full zone details
-        if in_zone and zone_details:
-            result['zone_details'] = zone_details['properties']
-            result['zone_geometry'] = zone_details['geometry']
-            
-            # Highlight compliance status
-            compliance = zone_details['properties'].get('Column1.compliance', None)
-            if compliance is False:
-                result['compliance_warning'] = "⚠️ NON-COMPLIANT ZONE - Column1.compliance: false"
-                result['compliance_status'] = "NON_COMPLIANT"
-            else:
-                result['compliance_status'] = "COMPLIANT" if compliance else "UNKNOWN"
-        
-        return jsonify(result), 200, headers
+        output_blob = get_gcs_blob(GCS_BUCKET_NAME, OUTPUT_GEOJSON_PATH)
+        output_blob.upload_from_string(
+            json.dumps(new_zones_geojson),
+            content_type="application/geo+json"
+        )
+        print(f"New no-swimming zones saved to GCS at gs://{GCS_BUCKET_NAME}/{OUTPUT_GEOJSON_PATH}")
+
+        # Update the hash file for the next run
+        hash_blob = get_gcs_blob(GCS_BUCKET_NAME, LAST_HASH_FILE_PATH)
+        hash_blob.upload_from_string(current_hash)
+        print("Hash file updated. Operation successful.")
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500, headers
+        print(f"Failed to save results to GCS: {e}")
+        return ("Failed to save results.", 500)
+        
+    return ("Analysis complete. New zones calculated and saved.", 200)
