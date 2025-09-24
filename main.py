@@ -20,7 +20,7 @@ def meters_to_degrees(meters, latitude):
 # Constants for the Cloud Function.
 # You need to replace these with your actual GCS bucket and file names.
 WASTEWATER_API_URL = "https://astikalimata.ypeka.gr/api/query/wastewatertreatmentplants"
-GCS_BUCKET_NAME = "mpelas-wastewater-bucket "
+GCS_BUCKET_NAME = "mpelas-wastewater-bucket"
 PERIFEREIES_GEOJSON_PATH = "perifereiesWGS84.geojson"
 LAST_HASH_FILE_PATH = "wastewater_data_hash.txt"
 OUTPUT_GEOJSON_PATH = "no_swim_zones/wastewater_no_swim_zones.geojson"
