@@ -53,8 +53,17 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
     """
     print("Starting geospatial analysis...")
     all_buffers = []
-    
-    for plant_feature in wastewater_data['features']:
+
+    # Check if the data is a FeatureCollection or a list of features
+    if isinstance(wastewater_data, dict) and 'features' in wastewater_data:
+        features_to_process = wastewater_data['features']
+    elif isinstance(wastewater_data, list):
+        features_to_process = wastewater_data
+    else:
+        print("Invalid wastewater data format.")
+        return None
+
+    for plant_feature in features_to_process:
         try:
             # Use .get() with a fallback to avoid KeyErrors
             props = plant_feature['properties']
@@ -70,36 +79,35 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
             if longitude is None or latitude is None:
                 print(f"Skipping plant '{props.get('Column1.name')}' due to missing coordinates.")
                 continue
-                
+
             # Create a Point geometry from the coordinates
             point = Point(longitude, latitude)
 
             # Convert 200m buffer distance to degrees at the given latitude
-            # We'll use the latitude conversion for both axes for simplicity
             buffer_lat_deg, buffer_lon_deg = meters_to_degrees(BUFFER_DISTANCE_METERS, math.radians(latitude))
             buffer_radius = buffer_lat_deg # Averages a reasonable buffer in degrees
-            
+
             # Create the 200m buffer around the point
             buffered_point = point.buffer(buffer_radius)
             all_buffers.append(buffered_point)
-        except KeyError as e:
-            print(f"Skipping plant due to missing coordinate: {e}")
+        except Exception as e:
+            print(f"Skipping plant due to an error processing its data: {e}")
             continue
 
     # Union all the individual buffers into a single MultiPolygon
     if not all_buffers:
         print("No valid wastewater points found. Exiting.")
         return None
-        
+
     unified_buffers = cascaded_union(all_buffers)
 
     # Union the perifereies geometries for the difference calculation
     unified_perifereies = cascaded_union(perifereies_geometries)
-    
+
     # Calculate the difference to find danger zones outside the mainland
     # The result is a new geometry representing the no-swim zones.
     danger_zones = unified_buffers.difference(unified_perifereies)
-    
+
     print("Geospatial analysis complete.")
     return danger_zones
 
@@ -111,7 +119,7 @@ def check_for_changes(request):
     recalculates and updates the no-swimming zones.
     """
     print("Function started.")
-    
+
     # 1. Fetch the latest wastewater data
     try:
         response = requests.get(WASTEWATER_API_URL, timeout=30)
@@ -122,7 +130,7 @@ def check_for_changes(request):
     except requests.exceptions.RequestException as e:
         print(f"Failed to fetch data from API: {e}")
         return ("Failed to fetch data.", 500)
-    
+
     # 2. Compare with the last known hash from GCS
     try:
         hash_blob = get_gcs_blob(GCS_BUCKET_NAME, LAST_HASH_FILE_PATH)
@@ -136,18 +144,18 @@ def check_for_changes(request):
     except Exception as e:
         print(f"Error checking last hash: {e}")
         # Continue anyway in case of an error accessing GCS
-        
+
     # 3. If changes detected, perform geospatial analysis
     print("Changes detected. Starting geospatial analysis...")
-    
+
     # Load the large Greek perifereies GeoJSON from GCS
     perifereies_geometries = load_perifereies_data(GCS_BUCKET_NAME, PERIFEREIES_GEOJSON_PATH)
     if perifereies_geometries is None:
         return ("Failed to load perifereies data.", 500)
-        
+
     # Calculate the new no-swimming zones
     danger_zones_geometry = calculate_new_zones(perifereies_geometries, wastewater_data)
-    
+
     if danger_zones_geometry is None:
         return ("Analysis failed.", 500)
 
@@ -164,7 +172,7 @@ def check_for_changes(request):
                 }
             ]
         }
-        
+
         output_blob = get_gcs_blob(GCS_BUCKET_NAME, OUTPUT_GEOJSON_PATH)
         output_blob.upload_from_string(
             json.dumps(new_zones_geojson),
@@ -176,9 +184,9 @@ def check_for_changes(request):
         hash_blob = get_gcs_blob(GCS_BUCKET_NAME, LAST_HASH_FILE_PATH)
         hash_blob.upload_from_string(current_hash)
         print("Hash file updated. Operation successful.")
-        
+
     except Exception as e:
         print(f"Failed to save results to GCS: {e}")
         return ("Failed to save results.", 500)
-        
+
     return ("Analysis complete. New zones calculated and saved.", 200)
