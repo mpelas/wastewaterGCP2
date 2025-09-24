@@ -6,6 +6,7 @@ from shapely.geometry import Point, mapping
 from shapely.ops import cascaded_union
 import math
 from google.cloud import storage
+from shapely import wkt # Import the wkt module to parse the WKT string
 
 # A simple helper function to convert meters to degrees at a given latitude.
 # This is necessary for accurate buffering with Shapely.
@@ -72,27 +73,28 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
                 # If 'properties' key is not present, assume the top-level keys are the properties
                 props = plant_feature
 
-            longitude = props.get('Column1.receiverLocation.1')
-            latitude = props.get('Column1.receiverLocation.2')
-
-            # Fallback to the regular latitude/longitude keys if receiverLocation keys are missing or null
-            if longitude is None or latitude is None:
-                longitude = props.get('Column1.longitude')
-                latitude = props.get('Column1.latitude')
-
-            # Skip the plant if no valid coordinates are found
-            if longitude is None or latitude is None:
-                print(f"Skipping plant '{props.get('Column1.name')}' due to missing coordinates.")
+            # Use the more reliable 'receiverLocation' key
+            receiver_location_wkt = props.get('receiverLocation')
+            
+            # Skip the plant if no valid receiverLocation is found
+            if receiver_location_wkt is None:
+                print(f"Skipping plant '{props.get('name')}' due to missing receiverLocation.")
                 continue
 
-            # Create a Point geometry from the coordinates
-            point = Point(longitude, latitude)
+            # Use shapely.wkt to parse the POINT string
+            try:
+                point = wkt.loads(receiver_location_wkt)
+                longitude = point.x
+                latitude = point.y
+            except Exception as e:
+                print(f"Skipping plant '{props.get('name')}' due to error parsing WKT: {e}")
+                continue
 
+            # Create the 200m buffer around the point
             # Convert 200m buffer distance to degrees at the given latitude
             buffer_lat_deg, buffer_lon_deg = meters_to_degrees(BUFFER_DISTANCE_METERS, math.radians(latitude))
             buffer_radius = buffer_lat_deg # Averages a reasonable buffer in degrees
 
-            # Create the 200m buffer around the point
             buffered_point = point.buffer(buffer_radius)
             all_buffers.append(buffered_point)
         except Exception as e:
