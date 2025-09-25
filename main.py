@@ -7,6 +7,7 @@ from shapely.ops import unary_union
 import math
 from google.cloud import storage
 from shapely import wkt
+import copy # Import copy module for clean metadata handling
 
 # A simple helper function to convert meters to degrees at a given latitude.
 # This is necessary for accurate buffering with Shapely.
@@ -14,12 +15,13 @@ def meters_to_degrees(meters, latitude):
     """
     Converts a distance in meters to degrees of latitude/longitude.
     """
-    meters_in_lat_deg = 111132.92 - 559.82 * math.cos(2 * latitude) + 1.175 * math.cos(4 * latitude)
-    meters_in_long_deg = 111412.84 * math.cos(latitude) - 93.5 * math.cos(3 * latitude)
+    # Note: math.cos expects radians, so latitude must be converted to radians before use
+    lat_rad = math.radians(latitude)
+    meters_in_lat_deg = 111132.92 - 559.82 * math.cos(2 * lat_rad) + 1.175 * math.cos(4 * lat_rad)
+    meters_in_long_deg = 111412.84 * math.cos(lat_rad) - 93.5 * math.cos(3 * lat_rad) * math.cos(lat_rad)
     return meters / meters_in_lat_deg, meters / meters_in_long_deg
 
 # Constants for the Cloud Function.
-# You need to replace these with your actual GCS bucket and file names.
 WASTEWATER_API_URL = "https://astikalimata.ypeka.gr/api/query/wastewatertreatmentplants"
 GCS_BUCKET_NAME = "mpelas-wastewater-bucket"
 PERIFEREIES_GEOJSON_PATH = "perifereiesWGS84.geojson"
@@ -49,16 +51,14 @@ def load_perifereies_data(bucket_name, file_path):
         print(f"Error loading perifereies GeoJSON: {e}")
         return None
 
-# --- CORE LOGIC MODIFIED HERE ---
 def calculate_new_zones(perifereies_geometries, wastewater_data):
     """
-    Performs the core geospatial analysis: buffering, difference, and retention of metadata.
-    Returns a list of tuples: (Shapely Geometry, Metadata Dictionary).
+    Performs the core geospatial analysis: buffering, difference, and retention of ALL metadata.
+    Returns a list of tuples: (Shapely Geometry, ALL Metadata Dictionary).
     """
-    print("Starting geospatial analysis with metadata retention...")
+    print("Starting geospatial analysis with full metadata retention...")
     
     # Union the perifereies geometries once for efficient difference calculation
-    # This is safe and necessary for the difference operation.
     unified_perifereies = unary_union(perifereies_geometries)
     
     no_swim_zones_with_metadata = []
@@ -74,21 +74,15 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
 
     for plant_feature in features_to_process:
         try:
-            # Extract properties
+            # Extract the metadata dictionary (either from 'properties' or the top level)
             props = plant_feature.get('properties', plant_feature)
             
-            # Prepare metadata for the final GeoJSON feature
-            # Only include relevant metadata fields
-            metadata = {
-                'code': props.get('code'),
-                'name': props.get('name'),
-                'receiverName': props.get('receiverName'),
-                'receiverNameEn': props.get('receiverNameEn'),
-                'receiverWaterType': props.get('receiverWaterType'),
-                'latitude': props.get('latitude'),
-                'longitude': props.get('longitude')
-            }
+            # --- Metadata Handling ---
+            # Copy ALL properties to use as metadata for the final GeoJSON feature
+            # The .copy() ensures we don't modify the source data
+            metadata = copy.copy(props)
 
+            # --- Location Logic (Priority: receiverLocation WKT > Plant Lat/Lon) ---
             receiver_location_wkt = props.get('receiverLocation')
             longitude = props.get('longitude')
             latitude = props.get('latitude')
@@ -105,22 +99,25 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
                 # Priority 2: Fallback to main plant coordinates
                 if longitude is not None and latitude is not None:
                     point = Point(longitude, latitude)
+                    # Update metadata to reflect the source of coordinates if necessary, though the original lat/lon are already there.
                     print(f"Using main plant coordinates for '{props.get('name')}' as receiverLocation is missing/invalid.")
                 else:
                     print(f"Skipping plant '{props.get('name')}' due to missing coordinates.")
                     continue
 
-            # Calculate buffer
+            # --- Geospatial Processing ---
+            
             # Convert 200m buffer distance to degrees at the given latitude
-            buffer_lat_deg, buffer_lon_deg = meters_to_degrees(BUFFER_DISTANCE_METERS, math.radians(point.y))
-            buffer_radius = buffer_lat_deg # Use latitude degree equivalent as the average radius
+            buffer_lat_deg, buffer_lon_deg = meters_to_degrees(BUFFER_DISTANCE_METERS, point.y)
+            # Use the latitude degree equivalent as the average radius for the buffer
+            buffer_radius = buffer_lat_deg 
 
             buffered_point = point.buffer(buffer_radius)
             
             # Perform Difference: Find the part of the buffer that is *not* on the mainland
             danger_zone = buffered_point.difference(unified_perifereies)
             
-            # If the difference results in a valid geometry (i.e., not empty), save it
+            # If the difference results in a valid maritime geometry (i.e., not empty), save it
             if not danger_zone.is_empty:
                 no_swim_zones_with_metadata.append((danger_zone, metadata))
                 
@@ -131,13 +128,13 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
     print(f"Geospatial analysis complete. Found {len(no_swim_zones_with_metadata)} no-swim zones.")
     return no_swim_zones_with_metadata
 
-# --- EXECUTION FLOW MODIFIED HERE ---
+# --- EXECUTION FLOW ---
 @functions_framework.http
 def check_for_changes(request):
     """
     Main entry point for the Google Cloud Function.
     Fetches wastewater data, checks for changes, and if found,
-    recalculates and updates the no-swimming zones with metadata.
+    recalculates and updates the no-swimming zones with ALL metadata.
     """
     print("Function started.")
 
@@ -174,12 +171,12 @@ def check_for_changes(request):
     if perifereies_geometries is None:
         return ("Failed to load perifereies data.", 500)
 
-    # Calculate the new no-swimming zones (Geometry, Metadata)
+    # Calculate the new no-swimming zones (Geometry, ALL Metadata)
     zones_list = calculate_new_zones(perifereies_geometries, wastewater_data)
 
     if not zones_list:
         print("Analysis completed, but no maritime danger zones were found.")
-        # Optionally create an empty GeoJSON file
+        # Create an empty GeoJSON file
         empty_geojson = {"type": "FeatureCollection", "features": []}
         output_blob = get_gcs_blob(GCS_BUCKET_NAME, OUTPUT_GEOJSON_PATH)
         output_blob.upload_from_string(json.dumps(empty_geojson), content_type="application/geo+json")
@@ -189,7 +186,7 @@ def check_for_changes(request):
 
     # 4. Save the new zones and update the hash in GCS
     try:
-        # Construct the GeoJSON FeatureCollection with metadata for each feature
+        # Construct the GeoJSON FeatureCollection with ALL metadata for each feature
         geojson_features = []
         for geometry, metadata in zones_list:
             geojson_features.append({
@@ -220,4 +217,4 @@ def check_for_changes(request):
         print(f"Failed to save results to GCS: {e}")
         return ("Failed to save results.", 500)
 
-    return ("Analysis complete. New zones calculated and saved with metadata.", 200)
+    return ("Analysis complete. New zones calculated and saved with full metadata.", 200)
