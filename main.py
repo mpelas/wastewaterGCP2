@@ -3,11 +3,10 @@ import requests
 import json
 import hashlib
 from shapely.geometry import Point, mapping, shape
-from shapely.ops import unary_union, transform  # <-- Add `transform` here
+from shapely.ops import cascaded_union, transform  # Add `transform` import
 import math
 from google.cloud import storage
-from pyproj import CRS, Transformer
-
+from pyproj import CRS, Transformer  # Add for reprojection
 
 # Constants for the Cloud Function.
 WASTEWATER_API_URL = "https://astikalimata.ypeka.gr/api/query/wastewatertreatmentplants"
@@ -37,11 +36,9 @@ def load_perifereies_data(bucket_name, file_path):
         blob = get_gcs_blob(bucket_name, file_path)
         geojson_data = blob.download_as_text()
         perifereies_features = json.loads(geojson_data)
-        # Convert GeoJSON geometries to Shapely geometry objects
         perifereies_geometries = [
             shape(f['geometry']) for f in perifereies_features['features']
         ]
-        print("Loaded perifereies GeoJSON.")
         return perifereies_geometries
     except Exception as e:
         print(f"Error loading perifereies GeoJSON: {e}")
@@ -65,7 +62,7 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
     for plant_feature in features_to_process:
         try:
             # Extract properties
-            props = plant_feature.get('properties', plant_feature)
+            props = plant_feature['properties']
             # Get coordinates (prioritize receiverLocation, fallback to latitude/longitude)
             longitude = props.get('Column1.receiverLocation.1')
             latitude = props.get('Column1.receiverLocation.2')
@@ -74,7 +71,8 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
                 latitude = props.get('Column1.latitude')
             # Skip if no valid coordinates
             if longitude is None or latitude is None:
-                print(f"Skipping plant '{props.get('Column1.name')}' due to missing coordinates.")
+                plant_name = props.get('Column1.name') or 'Unknown'
+                print(f"Skipping plant '{plant_name}' due to missing coordinates.")
                 continue
             # Create WGS84 point
             point_wgs84 = Point(longitude, latitude)
@@ -93,14 +91,13 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
     if not all_buffers:
         print("No valid wastewater points found. Exiting.")
         return None
-    unified_buffers = unary_union(all_buffers)
+    unified_buffers = cascaded_union(all_buffers)
     # Union perifereies geometries
-    unified_perifereies = unary_union(perifereies_geometries)
+    unified_perifereies = cascaded_union(perifereies_geometries)
     # Calculate danger zones (buffers not on mainland)
     danger_zones = unified_buffers.difference(unified_perifereies)
     print("Geospatial analysis complete.")
     return danger_zones
-
 
 @functions_framework.http
 def check_for_changes(request):
@@ -108,7 +105,6 @@ def check_for_changes(request):
     Main entry point for the Google Cloud Function.
     """
     print("Function started.")
-
     # 1. Fetch wastewater data
     try:
         response = requests.get(WASTEWATER_API_URL, timeout=30)
@@ -119,7 +115,6 @@ def check_for_changes(request):
     except requests.exceptions.RequestException as e:
         print(f"Failed to fetch data from API: {e}")
         return ("Failed to fetch data.", 500)
-
     # 2. Compare hash
     try:
         hash_blob = get_gcs_blob(GCS_BUCKET_NAME, LAST_HASH_FILE_PATH)
@@ -132,17 +127,14 @@ def check_for_changes(request):
             print("No previous hash found. Proceeding with analysis.")
     except Exception as e:
         print(f"Error checking last hash: {e}")
-
     # 3. Load perifereies data
     perifereies_geometries = load_perifereies_data(GCS_BUCKET_NAME, PERIFEREIES_GEOJSON_PATH)
     if perifereies_geometries is None:
         return ("Failed to load perifereies data.", 500)
-
     # 4. Calculate danger zones
     danger_zones_geometry = calculate_new_zones(perifereies_geometries, wastewater_data)
     if danger_zones_geometry is None:
         return ("Analysis failed.", 500)
-
     # 5. Save results
     try:
         new_zones_geojson = {
@@ -161,14 +153,11 @@ def check_for_changes(request):
             content_type="application/geo+json"
         )
         print(f"Saved to GCS: gs://{GCS_BUCKET_NAME}/{OUTPUT_GEOJSON_PATH}")
-
         # Update hash
         hash_blob = get_gcs_blob(GCS_BUCKET_NAME, LAST_HASH_FILE_PATH)
         hash_blob.upload_from_string(current_hash)
         print("Hash file updated.")
-
     except Exception as e:
         print(f"Failed to save results: {e}")
         return ("Failed to save results.", 500)
-
     return ("Analysis complete. New zones saved.", 200)
