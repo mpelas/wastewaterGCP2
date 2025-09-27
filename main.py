@@ -1,120 +1,187 @@
-import json
-import logging
-import math
-import os
+import functions_framework
 import requests
-from flask import Flask, jsonify
+import json
+import hashlib
+from shapely.geometry import Point, mapping, shape
+from shapely.ops import unary_union
+import math
+from google.cloud import storage
 from pyproj import CRS, Transformer
-from shapely.geometry import Point
-from shapely.ops import transform
-from werkzeug.exceptions import BadRequest, InternalServerError
 
-# Setting up basic logging for the Flask app.
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Constants for the Cloud Function.
+WASTEWATER_API_URL = "https://astikalimata.ypeka.gr/api/query/wastewatertreatmentplants"
+GCS_BUCKET_NAME = "mpelas-wastewater-bucket"
+PERIFEREIES_GEOJSON_PATH = "perifereiesWGS84.geojson"
+LAST_HASH_FILE_PATH = "wastewater_data_hash.txt"
+OUTPUT_GEOJSON_PATH = "no_swim_zones/wastewater_no_swim_zones.geojson"
+BUFFER_DISTANCE_METERS = 200
 
-# The API URL for fetching the data.
-DATA_API_URL = os.environ.get("DATA_API_URL")
-if not DATA_API_URL:
-    logger.error("DATA_API_URL environment variable is not set.")
-    # In a real app, you might want to handle this more gracefully.
-    DATA_API_URL = "http://localhost:8000/data"
+# Define coordinate reference systems
+WGS84_CRS = CRS("EPSG:4326")  # Standard GPS coordinates
+GREEK_GRID_CRS = CRS("EPSG:2100")  # Greek Grid for accurate meters
 
-app = Flask(__name__)
-
-# Define the coordinate reference systems (CRS) for reprojection.
-# WGS84 (EPSG:4326) is the standard for web maps.
-WGS84_CRS = CRS("EPSG:4326")
-# Greek Grid (EPSG:2100) is a suitable projected system for accurate measurements in Greece.
-GREEK_GRID_CRS = CRS("EPSG:2100")
-
-# Create a transformer to convert from WGS84 to Greek Grid.
-# The `always_xy=True` ensures the output order is always (longitude, latitude) for WGS84.
+# Create transformers
 transformer_to_greek_grid = Transformer.from_crs(WGS84_CRS, GREEK_GRID_CRS, always_xy=True)
-# Create a transformer to convert back from Greek Grid to WGS84.
 transformer_to_wgs84 = Transformer.from_crs(GREEK_GRID_CRS, WGS84_CRS, always_xy=True)
 
-@app.route("/no-swim-zones", methods=["GET"])
-def get_no_swim_zones():
-    """
-    Fetches wastewater treatment plant data, creates 200m buffer zones around them
-    using accurate coordinate system reprojection, and returns the result as GeoJSON.
-    """
+def get_gcs_blob(bucket_name, blob_name):
+    """Retrieves a blob from Google Cloud Storage."""
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    return bucket.blob(blob_name)
+
+def load_perifereies_data(bucket_name, file_path):
+    """Loads and parses the perifereies GeoJSON file from GCS."""
     try:
-        # Step 1: Fetch data from the external API.
-        response = requests.get(DATA_API_URL)
-        response.raise_for_status()  # Raise an exception for bad status codes.
-        data = response.json()
-        logger.info(f"Successfully fetched {len(data)} records from the data API.")
+        blob = get_gcs_blob(bucket_name, file_path)
+        geojson_data = blob.download_as_text()
+        perifereies_features = json.loads(geojson_data)
+        # Convert GeoJSON geometries to Shapely geometry objects
+        perifereies_geometries = [
+            shape(f['geometry']) for f in perifereies_features['features']
+        ]
+        print("Loaded perifereies GeoJSON.")
+        return perifereies_geometries
+    except Exception as e:
+        print(f"Error loading perifereies GeoJSON: {e}")
+        return None
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching data from API: {e}")
-        raise InternalServerError("Failed to fetch data from the source API.")
+def calculate_new_zones(perifereies_geometries, wastewater_data):
+    """
+    Performs the core geospatial analysis: buffering, union, and difference.
+    Uses Greek Grid (EPSG:2100) for accurate 200m circular buffers.
+    """
+    print("Starting geospatial analysis with Greek Grid reprojection...")
+    all_buffers = []
 
-    # Step 2: Ensure the data is in the expected GeoJSON format.
-    # The API might return a list of features, so we need to handle both cases.
-    features = data.get("features", data)
-    if not isinstance(features, list):
-        logger.error("API response is not a valid GeoJSON FeatureCollection or a list of features.")
-        raise BadRequest("Invalid data format from the source API.")
+    # Check data format
+    if isinstance(wastewater_data, dict) and 'features' in wastewater_data:
+        features_to_process = wastewater_data['features']
+    elif isinstance(wastewater_data, list):
+        features_to_process = wastewater_data
+    else:
+        print("Invalid wastewater data format.")
+        return None
 
-    no_swim_zones = {
-        "type": "FeatureCollection",
-        "features": []
-    }
-
-    # Step 3: Iterate through the features and create buffer zones.
-    for feature in features:
-        props = feature.get("properties")
-        if not props:
-            continue
-
-        lat = props.get("Column1.latitude")
-        lon = props.get("Column1.longitude")
-
-        # Skip features without valid coordinates.
-        if not isinstance(lat, (float, int)) or not isinstance(lon, (float, int)):
-            continue
-
+    for plant_feature in features_to_process:
         try:
-            # Step 4: Create a Point geometry from the WGS84 coordinates.
-            point_wgs84 = Point(lon, lat)
+            # Extract properties
+            props = plant_feature.get('properties', plant_feature)
 
-            # Step 5: Reproject the point to the Greek Grid (EPSG:2100).
-            # This is the key step to get accurate measurements in meters.
-            point_greek_grid = transform(transformer_to_greek_grid.transform, point_wgs84)
+            # Get coordinates (prioritize receiverLocation, fallback to latitude/longitude)
+            longitude = props.get('Column1.receiverLocation.1')
+            latitude = props.get('Column1.receiverLocation.2')
+            if longitude is None or latitude is None:
+                longitude = props.get('Column1.longitude')
+                latitude = props.get('Column1.latitude')
 
-            # Step 6: Create a 200-meter buffer around the point in the Greek Grid.
-            # Because EPSG:2100 is a projected system, this buffer will be a perfect circle
-            # of exactly 200 meters radius.
-            buffer_greek_grid = point_greek_grid.buffer(200)
+            # Skip if no valid coordinates
+            if longitude is None or latitude is None:
+                print(f"Skipping plant '{props.get('Column1.name')}' due to missing coordinates.")
+                continue
 
-            # Step 7: Reproject the buffer polygon back to WGS84.
-            # This is necessary so it can be displayed correctly on a web map.
+            # Create WGS84 point
+            point_wgs84 = Point(longitude, latitude)
+
+            # Reproject to Greek Grid
+            x, y = transformer_to_greek_grid.transform(point_wgs84.x, point_wgs84.y)
+            point_greek_grid = Point(x, y)
+
+            # Create 200m circular buffer in Greek Grid (meters)
+            buffer_greek_grid = point_greek_grid.buffer(BUFFER_DISTANCE_METERS)
+
+            # Reproject buffer back to WGS84
             buffer_wgs84 = transform(transformer_to_wgs84.transform, buffer_greek_grid)
 
-            # Step 8: Create a new GeoJSON Feature for the buffer zone.
-            buffer_feature = {
-                "type": "Feature",
-                "properties": {
-                    "name": props.get("Column1.name"),
-                    "nameEn": props.get("Column1.nameEn"),
-                    "code": props.get("Column1.code"),
-                    "description": "No-swim zone (200m buffer)"
-                },
-                "geometry": {
-                    "type": "Polygon",
-                    "coordinates": [list(buffer_wgs84.exterior.coords)]
-                }
-            }
-            no_swim_zones["features"].append(buffer_feature)
+            all_buffers.append(buffer_wgs84)
 
         except Exception as e:
-            logger.error(f"Error processing feature {props.get('Column1.code', 'N/A')}: {e}")
-            # Continue to process other features even if one fails.
+            print(f"Skipping plant due to an error: {e}")
+            continue
 
-    # Step 9: Return the final GeoJSON FeatureCollection.
-    return jsonify(no_swim_zones)
+    # Union all buffers
+    if not all_buffers:
+        print("No valid wastewater points found. Exiting.")
+        return None
 
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8081)))
+    unified_buffers = unary_union(all_buffers)
+
+    # Union perifereies geometries
+    unified_perifereies = unary_union(perifereies_geometries)
+
+    # Calculate danger zones (buffers not on mainland)
+    danger_zones = unified_buffers.difference(unified_perifereies)
+
+    print("Geospatial analysis complete.")
+    return danger_zones
+
+@functions_framework.http
+def check_for_changes(request):
+    """
+    Main entry point for the Google Cloud Function.
+    """
+    print("Function started.")
+
+    # 1. Fetch wastewater data
+    try:
+        response = requests.get(WASTEWATER_API_URL, timeout=30)
+        response.raise_for_status()
+        wastewater_data = response.json()
+        current_data_string = json.dumps(wastewater_data, sort_keys=True)
+        current_hash = hashlib.sha256(current_data_string.encode('utf-8')).hexdigest()
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to fetch data from API: {e}")
+        return ("Failed to fetch data.", 500)
+
+    # 2. Compare hash
+    try:
+        hash_blob = get_gcs_blob(GCS_BUCKET_NAME, LAST_HASH_FILE_PATH)
+        if hash_blob.exists():
+            last_hash = hash_blob.download_as_text()
+            if current_hash == last_hash:
+                print("No changes detected. Exiting.")
+                return ("No changes detected.", 200)
+        else:
+            print("No previous hash found. Proceeding with analysis.")
+    except Exception as e:
+        print(f"Error checking last hash: {e}")
+
+    # 3. Load perifereies data
+    perifereies_geometries = load_perifereies_data(GCS_BUCKET_NAME, PERIFEREIES_GEOJSON_PATH)
+    if perifereies_geometries is None:
+        return ("Failed to load perifereies data.", 500)
+
+    # 4. Calculate danger zones
+    danger_zones_geometry = calculate_new_zones(perifereies_geometries, wastewater_data)
+    if danger_zones_geometry is None:
+        return ("Analysis failed.", 500)
+
+    # 5. Save results
+    try:
+        new_zones_geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": mapping(danger_zones_geometry),
+                    "properties": {}
+                }
+            ]
+        }
+        output_blob = get_gcs_blob(GCS_BUCKET_NAME, OUTPUT_GEOJSON_PATH)
+        output_blob.upload_from_string(
+            json.dumps(new_zones_geojson),
+            content_type="application/geo+json"
+        )
+        print(f"Saved to GCS: gs://{GCS_BUCKET_NAME}/{OUTPUT_GEOJSON_PATH}")
+
+        # Update hash
+        hash_blob = get_gcs_blob(GCS_BUCKET_NAME, LAST_HASH_FILE_PATH)
+        hash_blob.upload_from_string(current_hash)
+        print("Hash file updated.")
+
+    except Exception as e:
+        print(f"Failed to save results: {e}")
+        return ("Failed to save results.", 500)
+
+    return ("Analysis complete. New zones saved.", 200)
