@@ -3,10 +3,11 @@ import requests
 import json
 import hashlib
 from shapely.geometry import Point, mapping, shape
-from shapely.ops import unary_union
+from shapely.ops import unary_union, transform  # <-- Add `transform` here
 import math
 from google.cloud import storage
 from pyproj import CRS, Transformer
+
 
 # Constants for the Cloud Function.
 WASTEWATER_API_URL = "https://astikalimata.ypeka.gr/api/query/wastewatertreatmentplants"
@@ -53,7 +54,6 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
     """
     print("Starting geospatial analysis with Greek Grid reprojection...")
     all_buffers = []
-
     # Check data format
     if isinstance(wastewater_data, dict) and 'features' in wastewater_data:
         features_to_process = wastewater_data['features']
@@ -62,58 +62,45 @@ def calculate_new_zones(perifereies_geometries, wastewater_data):
     else:
         print("Invalid wastewater data format.")
         return None
-
     for plant_feature in features_to_process:
         try:
             # Extract properties
             props = plant_feature.get('properties', plant_feature)
-
             # Get coordinates (prioritize receiverLocation, fallback to latitude/longitude)
             longitude = props.get('Column1.receiverLocation.1')
             latitude = props.get('Column1.receiverLocation.2')
             if longitude is None or latitude is None:
                 longitude = props.get('Column1.longitude')
                 latitude = props.get('Column1.latitude')
-
             # Skip if no valid coordinates
             if longitude is None or latitude is None:
                 print(f"Skipping plant '{props.get('Column1.name')}' due to missing coordinates.")
                 continue
-
             # Create WGS84 point
             point_wgs84 = Point(longitude, latitude)
-
             # Reproject to Greek Grid
             x, y = transformer_to_greek_grid.transform(point_wgs84.x, point_wgs84.y)
             point_greek_grid = Point(x, y)
-
             # Create 200m circular buffer in Greek Grid (meters)
             buffer_greek_grid = point_greek_grid.buffer(BUFFER_DISTANCE_METERS)
-
             # Reproject buffer back to WGS84
             buffer_wgs84 = transform(transformer_to_wgs84.transform, buffer_greek_grid)
-
             all_buffers.append(buffer_wgs84)
-
         except Exception as e:
             print(f"Skipping plant due to an error: {e}")
             continue
-
     # Union all buffers
     if not all_buffers:
         print("No valid wastewater points found. Exiting.")
         return None
-
     unified_buffers = unary_union(all_buffers)
-
     # Union perifereies geometries
     unified_perifereies = unary_union(perifereies_geometries)
-
     # Calculate danger zones (buffers not on mainland)
     danger_zones = unified_buffers.difference(unified_perifereies)
-
     print("Geospatial analysis complete.")
     return danger_zones
+
 
 @functions_framework.http
 def check_for_changes(request):
